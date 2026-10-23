@@ -1,36 +1,44 @@
 from flask import Flask, Response, redirect, request
+import xml.etree.ElementTree as ET
+import urllib.request
 import yt_dlp
 
 app = Flask(__name__)
 
-# Ваши официальные каналы VK Видео
-STREAM_URL = "https://vkvideo.ru"
-CHANNEL_URL = "https://vkvideo.ru"
+# Ссылка на ваш стрим
+STREAM_URL = "https://live.vkvideo.ru/btvrestored"
 
-def get_archive_videos(channel_url, count=10):
-    """Получает список последних видео из архива канала"""
-    ydl_opts = {
-        'quiet': True,
-        'no_warnings': True,
-        'extract_flat': 'in_playlist',  # Быстро собирает только названия и ID без тяжелого парсинга
-        'playlist_items': f'1-{count}'  # Задаем количество видео из архива
-    }
+# RSS-лента вашего канала для мгновенного получения архива видео без блокировок
+# (VK автоматически транслирует сюда все новые ролики)
+RSS_URL = "https://vk.com"
+
+CHROME_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+
+def get_archive_from_rss(rss_url, count=10):
+    """Быстро и надежно вытягивает последние видео через RSS-фид ВКонтакте"""
     videos = []
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(channel_url, download=False)
-            if 'entries' in info:
-                for entry in info['entries']:
-                    if entry:
-                        # Формируем прямую ссылку на ролик из его ID
-                        video_id = entry.get('id')
-                        title = entry.get('title', 'Архивное видео')
-                        if video_id:
-                            # Корректный URL для VK Видео
-                            full_url = f"https://vkvideo.ru{video_id}"
-                            videos.append({"name": title, "url": full_url})
+        req = urllib.request.Request(
+            rss_url, 
+            headers={'User-Agent': CHROME_USER_AGENT}
+        )
+        with urllib.request.urlopen(req) as response:
+            xml_data = response.read()
+            
+        root = ET.fromstring(xml_data)
+        # Ищем все элементы <item> (это и есть видеоролики)
+        items = root.findall('.//item')
+        
+        for item in items[:count]:
+            title = item.find('title').text if item.find('title') is not None else "Архивное видео"
+            link = item.find('link').text if item.find('link') is not None else None
+            
+            if link:
+                # Очищаем ссылку от лишних параметров, если они есть
+                clean_url = link.split('?')[0]
+                videos.append({"name": title, "url": clean_url})
     except Exception as e:
-        print(f"Ошибка при получении архива: {e}")
+        print(f"Ошибка чтения RSS: {e}")
     return videos
 
 def get_single_stream_url(url):
@@ -38,7 +46,10 @@ def get_single_stream_url(url):
     ydl_opts = {
         'quiet': True,
         'no_warnings': True,
-        'extract_flat': False
+        'extract_flat': False,
+        'http_headers': {
+            'User-Agent': CHROME_USER_AGENT
+        }
     }
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -50,17 +61,17 @@ def get_single_stream_url(url):
 
 @app.route('/playlist.m3u')
 def get_playlist():
-    host = request.host_url.rstrip('/')
+    # Принудительно делаем ссылки внутри плейлиста безопасными (https)
+    host = request.host_url.rstrip('/').replace('http://', 'https://')
     
     m3u = "#EXTM3U\n"
-    # 1. Добавляем живой стрим (всегда на первой строчке)
+    # 1. Добавляем живой стрим
     m3u += f'#EXTINF:-1 tvg-logo="https://vk.com" group-title="Прямой эфир", BTV Live Стрим\n{host}/live\n'
     
-    # 2. Динамически подтягиваем архивные ролики
-    archive_videos = get_archive_videos(CHANNEL_URL, count=10)
+    # 2. Подтягиваем архивные ролики из RSS
+    archive_videos = get_archive_from_rss(RSS_URL, count=10)
     
-    for i, video in enumerate(archive_videos):
-        # Передаем URL видео в параметре запроса, чтобы не создавать под каждый ролик свой роут
+    for video in archive_videos:
         m3u += f'#EXTINF:-1 tvg-logo="https://vk.com" group-title="Архив передач", {video["name"]}\n{host}/stream?url={video["url"]}\n'
         
     return Response(m3u, mimetype='text/plain')
